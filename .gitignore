@@ -45,6 +45,7 @@ logs/
 # Data
 data/input/*
 data/output/*
+archive/medicine_data.csv
 !data/input/.gitkeep
 !data/output/.gitkeep
 
