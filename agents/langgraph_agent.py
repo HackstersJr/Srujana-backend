@@ -103,31 +103,17 @@ class LangGraphAgent(BaseAgent):
         return workflow.compile()
 
     def _analyze_query(self, state: GraphState) -> GraphState:
-        """Analyze if the query needs database access."""
+        """Lightweight analysis node.
+
+        This node no longer makes the final routing decision. It simply
+        records the user query into the state and defers routing to the
+        dedicated router function used by the conditional edges.
+        """
         try:
-            user_query = state["user_query"].lower()
-
-            # Simple keyword-based analysis
-            db_keywords = [
-                'show', 'list', 'get', 'find', 'search', 'query', 'select',
-                'table', 'database', 'data', 'record', 'count', 'how many',
-                'what are', 'display', 'retrieve'
-            ]
-
-            needs_db = any(keyword in user_query for keyword in db_keywords)
-
-            if not needs_db:
-                # General response for non-database queries
-                response = f"I understand you're asking about '{state['user_query']}'. This appears to be a general question. For database queries, please ask about data, tables, or records."
-                return {
-                    **state,
-                    "needs_db_access": False,
-                    "final_response": response
-                }
-
+            # Preserve the query in the state; the router will decide next step
             return {
                 **state,
-                "needs_db_access": True
+                "needs_db_access": None
             }
 
         except Exception as e:
@@ -234,13 +220,49 @@ class LangGraphAgent(BaseAgent):
         }
 
     def _route_after_analysis(self, state: GraphState) -> str:
-        """Route after query analysis."""
+        """Router function (decision node) that uses the LLM to pick the next path.
+
+        The router returns one of the keys mapped in the conditional edges:
+        - "generate_sql": the workflow should generate and run SQL
+        - "format_response": handle as a general/non-database question
+        - "error": an error was detected
+
+        The router asks the LLM to return exactly one keyword (no extra text).
+        """
+        # If there was an earlier error, short-circuit
         if state.get("error"):
             return "error"
-        elif state.get("needs_db_access"):
-            return "generate_sql"
-        else:
+
+        try:
+            user_query = state.get("user_query", "")
+
+            prompt = (
+                "Classify the following user request into exactly one of the keys:"
+                " generate_sql, format_response, or error. Return ONLY the key text, no explanation.\n\n"
+                f"User request: {user_query}\n"
+                "If the request appears to ask for data from the database (e.g., list, count, select, show, find records),"
+                " return generate_sql. If it's a general question or requires explanation (not a DB read), return format_response."
+                " If the request is ambiguous or cannot be processed, return error."
+            )
+
+            # Use the LLM synchronously here (the StateGraph router is expected to be quick)
+            llm_resp = self.llm.invoke([HumanMessage(content=prompt)])
+            choice = llm_resp.content.strip().lower()
+
+            # Normalize common outputs
+            if "generate" in choice:
+                return "generate_sql"
+            if "format" in choice or "general" in choice or "explain" in choice:
+                return "format_response"
+            if "error" in choice or "unknown" in choice or "cannot" in choice:
+                return "error"
+
+            # Fallback: try a conservative default
             return "format_response"
+
+        except Exception as e:
+            self.logger.error(f"Router failed: {str(e)}")
+            return "error"
 
     async def run(self, query: str) -> str:
         """Run the LangGraph workflow for a natural language query."""

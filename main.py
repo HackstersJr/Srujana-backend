@@ -19,6 +19,8 @@ load_dotenv()
 from agents.langchain_agent import LangChainAgent
 from agents.langgraph_agent import LangGraphAgent
 from agents.toolbox_agent import ToolboxAgent
+from agents.medicine_agent import MedicineAgent
+from agents.database_agent import DatabaseAgent
 from configs.logging_config import get_logger, setup_agent_logging
 # Import our modules
 from configs.settings import get_settings
@@ -41,15 +43,17 @@ class QueryRequest(BaseModel):
     If `query` is missing but `message` is provided, copy `message` into `query`.
     """
 
-    query: Optional[str] = None
+    # We treat `message` as the canonical field. For backwards compatibility
+    # accept `query` and copy into message when provided.
     message: Optional[str] = None
-    agent_type: str = "langchain"  # "langchain" or "toolbox"
+    query: Optional[str] = None
+    agent_type: Optional[str] = None  # if omitted, backend will decide
 
     @root_validator(pre=True)
     def ensure_query(cls, values):
-        # If query not provided but message is, use message as query for compatibility
-        if not values.get("query") and values.get("message"):
-            values["query"] = values.get("message")
+        # If message missing but query provided (old clients), copy query->message
+        if not values.get("message") and values.get("query"):
+            values["message"] = values.get("query")
         return values
 
 
@@ -82,6 +86,9 @@ class AgentSystem:
         self.langchain_agent = None
         self.toolbox_agent = None
         self.langgraph_agent = None
+        self.langchain_agent_secondary = None
+        self.medicine_agent = None
+        self.database_agent = None
 
         self.is_running = False
 
@@ -139,6 +146,16 @@ class AgentSystem:
             )
             await self.langchain_agent.start()
 
+            # Secondary LangChain agent (different LLM config)
+            llm_configs = self.settings.get_llm_configs()
+            secondary_config = llm_configs.get("secondary", llm_configs.get("primary"))
+            self.langchain_agent_secondary = LangChainAgent(
+                config=secondary_config,
+                retrievers=[self.nanopq_retriever, self.embedchain_retriever],
+                db_service=self.db_service,
+                toolbox_service=self.toolbox_service,
+            )
+            await self.langchain_agent_secondary.start()
             # Toolbox agent
             self.toolbox_agent = ToolboxAgent(
                 config=self.settings.get_llm_config(),
@@ -154,6 +171,20 @@ class AgentSystem:
                 prisma_service=self.prisma_service,
             )
             await self.langgraph_agent.start()
+
+            # Database agent
+            self.database_agent = DatabaseAgent(
+                config=self.settings.get_llm_config(),
+                prisma_service=self.prisma_service,
+            )
+            await self.database_agent.start()
+
+            # Medicine agent
+            self.medicine_agent = MedicineAgent(
+                config=self.settings.get_llm_config(),
+                database_agent=self.database_agent,
+            )
+            await self.medicine_agent.start()
 
             self.is_running = True
             self.logger.info("Agent system initialized successfully")
@@ -177,6 +208,15 @@ class AgentSystem:
             if self.langgraph_agent:
                 await self.langgraph_agent.stop()
 
+            if self.langchain_agent_secondary:
+                await self.langchain_agent_secondary.stop()
+
+            if self.medicine_agent:
+                await self.medicine_agent.stop()
+
+            if self.database_agent:
+                await self.database_agent.stop()
+
             # Shutdown retrievers
             if self.nanopq_retriever:
                 await self.nanopq_retriever.stop()
@@ -197,20 +237,70 @@ class AgentSystem:
         except Exception as e:
             self.logger.error(f"Error during shutdown: {str(e)}")
 
-    async def process_query(self, query: str, agent_type: str = "langchain") -> str:
-        """Process a query using the specified agent."""
-        try:
-            if not self.is_running:
-                raise RuntimeError("Agent system is not running")
+    async def process_query(self, message: str, agent_type: Optional[str] = None) -> tuple:
+        """Process a message using the specified agent and return (response, agent_type_used)."""
+        if not self.is_running:
+            raise RuntimeError("Agent system is not running")
 
-            if agent_type == "langchain" and self.langchain_agent:
-                return await self.langchain_agent.run(query)
-            elif agent_type == "toolbox" and self.toolbox_agent:
-                return await self.toolbox_agent.run(query)
-            elif agent_type == "langgraph" and self.langgraph_agent:
-                return await self.langgraph_agent.run(query)
-            else:
+        try:
+            # If client specified agent_type, respect it
+            if agent_type:
+                if agent_type == "langchain" and self.langchain_agent:
+                    resp = await self.langchain_agent.run(message)
+                    return resp, "langchain"
+                if agent_type == "langchain_secondary" and self.langchain_agent_secondary:
+                    resp = await self.langchain_agent_secondary.run(message)
+                    return resp, "langchain_secondary"
+                if agent_type == "toolbox" and self.toolbox_agent:
+                    resp = await self.toolbox_agent.run(message)
+                    return resp, "toolbox"
+                if agent_type == "langgraph" and self.langgraph_agent:
+                    resp = await self.langgraph_agent.run(message)
+                    return resp, "langgraph"
                 raise ValueError(f"Unknown agent type: {agent_type}")
+
+            # Auto-selection: simple keyword-based routing
+            lower = (message or "").lower()
+
+            # Medicine-related requests -> MedicineAgent
+            medicine_keywords = [
+                "medicine", "medicines", "drug", "drugs", "pharmacy", "pharmaceutical",
+                "inventory", "stock", "inflow", "outflow", "expiry", "expire", "expiration",
+                "batch", "lot", "prescription", "dosage", "usage", "consumption"
+            ]
+            if any(k in lower for k in medicine_keywords):
+                if self.medicine_agent:
+                    resp = await self.medicine_agent.run(message)
+                    return resp, "medicine"
+
+            if any(k in lower for k in ["select", "show", "list", "find", "count", "where", "join"]):
+                # SQL-like request -> LangGraph
+                if self.langgraph_agent:
+                    resp = await self.langgraph_agent.run(message)
+                    return resp, "langgraph"
+
+            if any(k in lower for k in ["run", "shell", "file", "open", "read", "write"]):
+                if self.toolbox_agent:
+                    resp = await self.toolbox_agent.run(message)
+                    return resp, "toolbox"
+
+            # Otherwise choose between primary and secondary LLM based on length/heuristic
+            if len(message or "") < 200:
+                if self.langchain_agent:
+                    resp = await self.langchain_agent.run(message)
+                    return resp, "langchain"
+            else:
+                if self.langchain_agent_secondary:
+                    resp = await self.langchain_agent_secondary.run(message)
+                    return resp, "langchain_secondary"
+
+            # Fallback to primary
+            if self.langchain_agent:
+                resp = await self.langchain_agent.run(message)
+                return resp, "langchain"
+
+            # If nothing available
+            raise RuntimeError("No agent available to process the request")
 
         except Exception as e:
             self.logger.error(f"Failed to process query: {str(e)}")
@@ -291,20 +381,22 @@ async def process_query(request: QueryRequest):
 
         start_time = time.time()
 
-        # Process the query
-        if not request.query:
-            raise HTTPException(status_code=422, detail="Request must include a 'query' or 'message' field")
+        # Process the message (message is canonical)
+        if not request.message:
+            raise HTTPException(status_code=422, detail="Request must include a 'message' field")
 
-        response = await agent_system.process_query(request.query, request.agent_type)
+        response, used_agent = await agent_system.process_query(request.message, request.agent_type)
 
         processing_time = time.time() - start_time
 
         return QueryResponse(
             response=response,
-            agent_type=request.agent_type,
+            agent_type=used_agent,
             processing_time=processing_time,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error processing query: {str(e)}")
         raise HTTPException(
@@ -438,17 +530,19 @@ async def run_console_mode():
                         print(f"  {component}: {state}")
                     continue
 
-                # Determine agent type
-                agent_type = "langchain"
+                # Determine agent type (optional prefix)
+                agent_type = None
                 if query.startswith("toolbox "):
                     agent_type = "toolbox"
                     query = query[8:]  # Remove "toolbox " prefix
                 elif query.startswith("langchain "):
+                    agent_type = "langchain"
                     query = query[10:]  # Remove "langchain " prefix
 
-                # Process query
-                print(f"Processing with {agent_type} agent...")
-                response = await agent_system.process_query(query, agent_type)
+                # Process message
+                print(f"Processing with agent_type={agent_type}...")
+                response, used_agent = await agent_system.process_query(query, agent_type)
+                print(f"Used agent: {used_agent}")
                 print(f"Response: {response}")
                 print()
 

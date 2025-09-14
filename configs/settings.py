@@ -164,6 +164,25 @@ class Settings(BaseSettings):
             "max_iterations": self.llm.max_iterations,
         }
 
+    def get_llm_configs(self) -> Dict[str, Dict[str, Any]]:
+        """Return a map of LLM configurations (primary and secondary).
+
+        Secondary values may be provided by environment variables prefixed with
+        LLM_SECONDARY_. This allows running two LLMs and selecting at runtime.
+        """
+        primary = self.get_llm_config()
+
+        # Secondary LLM configuration (falls back to primary values)
+        secondary = {
+            "gemini_api_key": os.environ.get("GEMINI_API_KEY_SECONDARY", self.llm.gemini_api_key),
+            "model_name": os.environ.get("LLM_MODEL_NAME_SECONDARY", self.llm.model_name),
+            "temperature": float(os.environ.get("LLM_TEMPERATURE_SECONDARY", self.llm.temperature)),
+            "max_tokens": int(os.environ.get("LLM_MAX_TOKENS_SECONDARY", self.llm.max_tokens)),
+            "max_iterations": int(os.environ.get("LLM_MAX_ITERATIONS_SECONDARY", self.llm.max_iterations)),
+        }
+
+        return {"primary": primary, "secondary": secondary}
+
     def get_nanopq_config(self) -> Dict[str, Any]:
         """Get NanoPQ configuration as dictionary."""
         return {

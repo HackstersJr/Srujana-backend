@@ -356,6 +356,128 @@ async def seed_database():
         for patient_data in patients_data:
             await prisma_service.upsert_patient(patient_data)
 
+        # Add sample inventory and transactions
+        inventory_data = [
+            {
+                "medicineId": "med001",  # Will be replaced with actual medicine ID
+                "batchNumber": "BATCH001",
+                "expiryDate": "2025-12-31T00:00:00Z",
+                "quantity": 100,
+                "unitPrice": 15.50,
+                "supplier": "PharmaCorp"
+            },
+            {
+                "medicineId": "med002",  # Will be replaced with actual medicine ID
+                "batchNumber": "BATCH002",
+                "expiryDate": "2025-06-30T00:00:00Z",
+                "quantity": 50,
+                "unitPrice": 25.00,
+                "supplier": "MediSupply"
+            }
+        ]
+
+        # First create some medicines to get their IDs
+        medicine_ids = []
+        sample_medicines = [
+            {
+                "subCategory": "Analgesic",
+                "productName": "Paracetamol",
+                "saltComposition": "Paracetamol",
+                "productPrice": "12.5",
+                "productManufactured": "Pharma Inc",
+                "medicineDesc": "Pain reliever and fever reducer",
+                "sideEffects": "Nausea, dizziness",
+                "drugInteractions": "None"
+            },
+            {
+                "subCategory": "Antibiotic",
+                "productName": "Amoxicillin",
+                "saltComposition": "Amoxicillin",
+                "productPrice": "25.0",
+                "productManufactured": "MedCorp",
+                "medicineDesc": "Broad-spectrum antibiotic",
+                "sideEffects": "Rash, diarrhea",
+                "drugInteractions": "Warfarin"
+            }
+        ]
+
+        for med_data in sample_medicines:
+            # Check if medicine already exists
+            existing_med = await prisma_service.get_medicine_by_name(med_data["productName"])
+            if existing_med:
+                logger.info(f"Medicine {med_data['productName']} already exists, skipping...")
+                medicine_ids.append(existing_med['id'])
+            else:
+                med_result = await prisma_service.create_medicine(med_data)
+                if med_result:
+                    medicine_ids.append(med_result['id'])
+
+        # Update inventory with actual medicine IDs
+        if medicine_ids:
+            inventory_data[0]["medicineId"] = medicine_ids[0]
+            inventory_data[1]["medicineId"] = medicine_ids[0] if len(medicine_ids) > 1 else medicine_ids[0]
+
+        # Create inventory items
+        inventory_ids = []
+        for inv_data in inventory_data:
+            # Use direct string interpolation for timestamp
+            query = f"""
+                INSERT INTO inventory (id, "medicineId", "batchNumber", "expiryDate", quantity, "unitPrice", supplier, "createdAt", "updatedAt")
+                VALUES (gen_random_uuid(), '{inv_data["medicineId"]}', '{inv_data["batchNumber"]}', '{inv_data["expiryDate"]}'::timestamp, {inv_data["quantity"]}, {inv_data["unitPrice"]}, '{inv_data["supplier"]}', NOW(), NOW())
+                RETURNING id
+                """
+            inv_result = await prisma_service.execute_raw_query(query)
+            if inv_result:
+                inventory_ids.append(inv_result[0]['id'])
+
+        # Create sample transactions
+        if inventory_ids:
+            transaction_data = [
+                {
+                    "inventoryId": inventory_ids[0],
+                    "transactionType": "IN",
+                    "quantity": 100,
+                    "reason": "Initial stock",
+                    "performedBy": "System"
+                },
+                {
+                    "inventoryId": inventory_ids[0],
+                    "transactionType": "OUT",
+                    "quantity": 10,
+                    "reason": "Prescription dispensed",
+                    "performedBy": "Dr. Sarah Johnson"
+                }
+            ]
+
+            for trans_data in transaction_data:
+                await prisma_service.execute_raw_query(
+                    """
+                    INSERT INTO transactions (id, "inventoryId", "transactionType", quantity, "transactionDate", reason, "performedBy", "createdAt", "updatedAt")
+                    VALUES (gen_random_uuid(), $1, $2, $3, NOW(), $4, $5, NOW(), NOW())
+                    """,
+                    [trans_data["inventoryId"], trans_data["transactionType"], trans_data["quantity"], trans_data["reason"], trans_data["performedBy"]]
+                )
+
+        # Create expiry tracking
+        if inventory_ids and medicine_ids:
+            expiry_data = [
+                {
+                    "inventoryId": inventory_ids[0],
+                    "medicineId": medicine_ids[0],
+                    "batchNumber": "BATCH001",
+                    "expiryDate": "2025-12-31T00:00:00Z",
+                    "currentQuantity": 90,
+                    "status": "ACTIVE"
+                }
+            ]
+
+            for exp_data in expiry_data:
+                query = f"""
+                    INSERT INTO expiry_tracking (id, "inventoryId", "medicineId", "batchNumber", "expiryDate", "currentQuantity", status, "createdAt", "updatedAt")
+                    VALUES (gen_random_uuid(), '{exp_data["inventoryId"]}', '{exp_data["medicineId"]}', '{exp_data["batchNumber"]}', '{exp_data["expiryDate"]}'::timestamp, {exp_data["currentQuantity"]}, '{exp_data["status"]}', NOW(), NOW())
+                    """
+                await prisma_service.execute_raw_query(query)
+
         await prisma_service.disconnect()
 
         logger.info("Database seeded successfully")

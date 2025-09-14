@@ -108,6 +108,7 @@ model Medicine {
   // Relations
   prescriptionItems PrescriptionItem[]
   inventory         Inventory[]
+  expiryTracking    ExpiryTracking[]
 
   @@map("medicines")
 }
@@ -194,8 +195,58 @@ model Inventory {
 
   // Relations
   medicine          Medicine  @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+  transactions      Transaction[]
+  expiryTracking    ExpiryTracking[]
 
   @@map("inventory")
+}
+
+model Transaction {
+  id                String   @id @default(cuid())
+  inventoryId       String
+  transactionType   TransactionType
+  quantity          Int
+  transactionDate   DateTime @default(now())
+  reason            String?
+  performedBy       String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  inventory         Inventory @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+
+  @@map("transactions")
+}
+
+model ExpiryTracking {
+  id                String   @id @default(cuid())
+  inventoryId       String
+  medicineId        String
+  batchNumber       String
+  expiryDate        DateTime
+  currentQuantity   Int
+  status            ExpiryStatus @default(ACTIVE)
+  alertSent         Boolean @default(false)
+  alertDate         DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  inventory         Inventory @relation(fields: [inventoryId], references: [id], onDelete: Cascade)
+  medicine          Medicine  @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+
+  @@map("expiry_tracking")
+}
+
+enum TransactionType {
+  IN
+  OUT
+}
+
+enum ExpiryStatus {
+  ACTIVE
+  EXPIRED
+  ALERT_SENT
 }
 
 enum AppointmentStatus {
