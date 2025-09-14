@@ -1,0 +1,164 @@
+name: Deploy to Container Registry
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      registry:
+        description: 'Container registry (docker.io, gcr.io, ghcr.io)'
+        required: true
+        default: 'docker.io'
+      repository:
+        description: 'Repository name'
+        required: true
+        default: 'carecloud-agent'
+      tag:
+        description: 'Image tag'
+        required: false
+        default: 'latest'
+
+env:
+  REGISTRY: ${{ github.event.inputs.registry || 'docker.io' }}
+  REPOSITORY: ${{ github.event.inputs.repository || 'carecloud-agent' }}
+  TAG: ${{ github.event.inputs.tag || github.ref_name || 'latest' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Docker Hub
+      if: env.REGISTRY == 'docker.io'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Login to GitHub Container Registry
+      if: env.REGISTRY == 'ghcr.io'
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Login to Google Container Registry
+      if: env.REGISTRY == 'gcr.io'
+      uses: docker/login-action@v3
+      with:
+        registry: gcr.io
+        username: _json_key
+        password: ${{ secrets.GCR_JSON_KEY }}
+
+    - name: Load Docker image
+      run: |
+        if [ -f "carecloud-agent-image.tar" ]; then
+          docker load -i carecloud-agent-image.tar
+          IMAGE_ID=$(docker images --format "table {{.Repository}}\t{{.ID}}" | grep "agent-project-agent" | head -n1 | awk '{print $2}')
+          echo "IMAGE_ID=$IMAGE_ID" >> $GITHUB_ENV
+        else
+          echo "Building image from source..."
+          docker build -t agent-project-agent .
+          echo "IMAGE_ID=agent-project-agent" >> $GITHUB_ENV
+        fi
+
+    - name: Tag and push image
+      run: |
+        FULL_IMAGE_NAME="${REGISTRY}/${REPOSITORY}/${TAG}"
+        echo "Pushing to: $FULL_IMAGE_NAME"
+
+        docker tag ${{ env.IMAGE_ID }} $FULL_IMAGE_NAME
+        docker push $FULL_IMAGE_NAME
+
+        # Also tag as latest if this is a version tag
+        if [[ $TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          docker tag ${{ env.IMAGE_ID }} ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:latest
+          docker push ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:latest
+        fi
+
+    - name: Generate deployment instructions
+      run: |
+        cat << EOF > deployment-instructions.md
+        # CareCloud AI Agent - Registry Deployment
+
+        ## Image Information
+        - **Registry**: ${{ env.REGISTRY }}
+        - **Repository**: ${{ env.REPOSITORY }}
+        - **Tag**: ${{ env.TAG }}
+        - **Full Image Name**: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.TAG }}
+
+        ## Quick Deployment
+
+        ### Docker Compose
+        \`\`\`yaml
+        version: '3.8'
+        services:
+          carecloud-agent:
+            image: ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.TAG }}
+            ports:
+              - "8000:8000"
+            environment:
+              - GEMINI_API_KEY=your_gemini_api_key_here
+              - DB_HOST=localhost
+              - DB_USER=postgres
+              - DB_PASSWORD=postgres123
+              - DB_NAME=carecloud
+            depends_on:
+              - postgres
+              - redis
+
+          postgres:
+            image: postgres:15-alpine
+            environment:
+              - POSTGRES_DB=carecloud
+              - POSTGRES_USER=postgres
+              - POSTGRES_PASSWORD=postgres123
+            volumes:
+              - postgres_data:/var/lib/postgresql/data
+
+          redis:
+            image: redis:7-alpine
+
+        volumes:
+          postgres_data:
+        \`\`\`
+
+        ### Docker Run
+        \`\`\`bash
+        docker run -d \\
+          --name carecloud-agent \\
+          -p 8000:8000 \\
+          -e GEMINI_API_KEY=your_gemini_api_key_here \\
+          -e DB_HOST=host.docker.internal \\
+          -e DB_USER=postgres \\
+          -e DB_PASSWORD=postgres123 \\
+          -e DB_NAME=carecloud \\
+          ${{ env.REGISTRY }}/${{ env.REPOSITORY }}:${{ env.TAG }}
+        \`\`\`
+
+        ---
+        *Generated on $(date)*
+        EOF
+
+    - name: Upload deployment instructions
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-instructions
+        path: deployment-instructions.md
+
+    - name: Create release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: deployment-instructions.md
+        generate_release_notes: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

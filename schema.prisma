@@ -1,0 +1,207 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-py"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Patient {
+  id                String   @id @default(cuid())
+  firstName         String
+  lastName          String
+  dateOfBirth       DateTime
+  gender            String
+  phone             String?
+  email             String?   @unique
+  address           String?
+  emergencyContact  String?
+  medicalHistory    String?
+  allergies         String?
+  bloodType         String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  appointments      Appointment[]
+  prescriptions     Prescription[]
+  medicalRecords    MedicalRecord[]
+  labResults        LabResult[]
+
+  @@map("patients")
+}
+
+model Doctor {
+  id                String   @id @default(cuid())
+  firstName         String
+  lastName          String
+  specialization    String
+  licenseNumber     String   @unique
+  phone             String?
+  email             String?   @unique
+  department        String?
+  yearsOfExperience Int?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  appointments      Appointment[]
+  prescriptions     Prescription[]
+
+  @@map("doctors")
+}
+
+model Appointment {
+  id                String   @id @default(cuid())
+  patientId         String
+  doctorId          String
+  appointmentDate   DateTime
+  status            AppointmentStatus @default(SCHEDULED)
+  reason            String?
+  notes             String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  patient           Patient   @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctor            Doctor    @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+
+  @@map("appointments")
+}
+
+model MedicalRecord {
+  id                String   @id @default(cuid())
+  patientId         String
+  doctorId          String?
+  recordDate        DateTime @default(now())
+  recordType        String   // diagnosis, treatment, lab_result, etc.
+  description       String
+  diagnosis         String?
+  treatment         String?
+  notes             String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  patient           Patient   @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  @@map("medical_records")
+}
+
+model Medicine {
+  id                String   @id @default(cuid())
+  subCategory       String
+  productName       String   @unique
+  saltComposition   String?
+  productPrice      String?
+  productManufactured String?
+  medicineDesc      String?
+  sideEffects       String?
+  drugInteractions  String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  prescriptionItems PrescriptionItem[]
+  inventory         Inventory[]
+
+  @@map("medicines")
+}
+
+model Prescription {
+  id                String   @id @default(cuid())
+  patientId         String
+  doctorId          String
+  prescriptionDate  DateTime @default(now())
+  notes             String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  patient           Patient           @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctor            Doctor            @relation(fields: [doctorId], references: [id], onDelete: Cascade)
+  prescriptionItems PrescriptionItem[]
+
+  @@map("prescriptions")
+}
+
+model PrescriptionItem {
+  id                String   @id @default(cuid())
+  prescriptionId    String
+  medicineId        String
+  dosage            String
+  frequency         String
+  duration          String
+  instructions      String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  prescription      Prescription      @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  medicine          Medicine          @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+
+  @@map("prescription_items")
+}
+
+model LabTest {
+  id                String   @id @default(cuid())
+  testName          String
+  testCategory      String
+  normalRange       String?
+  unit              String?
+  description       String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  labResults        LabResult[]
+
+  @@map("lab_tests")
+}
+
+model LabResult {
+  id                String   @id @default(cuid())
+  patientId         String
+  testId            String
+  testDate          DateTime
+  result            String
+  isNormal          Boolean?
+  notes             String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  patient           Patient   @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  labTest           LabTest   @relation(fields: [testId], references: [id], onDelete: Cascade)
+
+  @@map("lab_results")
+}
+
+model Inventory {
+  id                String   @id @default(cuid())
+  medicineId        String
+  batchNumber       String
+  expiryDate        DateTime
+  quantity          Int
+  unitPrice         Float
+  supplier          String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relations
+  medicine          Medicine  @relation(fields: [medicineId], references: [id], onDelete: Cascade)
+
+  @@map("inventory")
+}
+
+enum AppointmentStatus {
+  SCHEDULED
+  CONFIRMED
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}

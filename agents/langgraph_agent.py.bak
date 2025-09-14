@@ -1,0 +1,827 @@
+"""
+Optimized LangGraph Agent for Natural Language to SQL Query Processing.
+"""
+
+import asyncio
+import logging
+import re
+from typing import Any, Dict, List, Optional, TypedDict, Annotated
+from functools import lru_cache
+from datetime import datetime
+
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage, AIMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.graph import END, StateGraph, add_messages
+
+from agents.base_agent import BaseAgent
+from services.db_service import DBService
+from services.prisma_service import PrismaService
+from services.toolbox_service import ToolboxService
+
+
+class SQLValidationError(Exception):
+    """Custom exception for SQL validation errors."""
+    pass
+
+
+class QueryComplexityError(Exception):
+    """Custom exception for overly complex queries."""
+    pass
+
+
+def update_field(current: Any, update: Any) -> Any:
+    """Universal reducer function - always take the latest non-None value."""
+    return update if update is not None else current
+
+
+class GraphState(TypedDict):
+    """Simplified state for the LangGraph workflow."""
+    messages: Annotated[List[BaseMessage], add_messages]
+    user_query: str
+    needs_db_access: Optional[bool]
+    sql_query: Optional[str]
+    query_results: Optional[List[Dict[str, Any]]]
+    final_response: Optional[str]
+    error: Optional[str]
+    attempt_count: int
+    query_type: Optional[str]
+    confidence: Optional[str]
+    retryable: Optional[bool]
+
+
+class LangGraphAgent(BaseAgent):
+    """
+    Optimized LangGraph Agent that converts natural language to SQL,
+    executes queries, and returns natural language responses.
+    """
+
+    def __init__(
+        self,
+        config: Dict[str, Any],
+        db_service: DBService,
+        prisma_service: PrismaService,
+        toolbox_service: ToolboxService,
+    ):
+        """
+        Initialize the LangGraph agent.
+
+        Args:
+            config: Agent configuration
+            db_service: Database service instance
+            prisma_service: Prisma service instance
+            toolbox_service: Toolbox service instance
+        """
+        super().__init__("langgraph_agent", config)
+        self.db_service = db_service
+        self.prisma_service = prisma_service
+        self.toolbox_service = toolbox_service
+        self.max_attempts = config.get("max_sql_attempts", 2)
+        self.result_limit = config.get("result_limit", 1000)
+        
+        self.llm = ChatGoogleGenerativeAI(
+            model=config.get("model_name", "gemini-1.5-flash"),
+            temperature=config.get("temperature", 0.1),
+            api_key=config.get("gemini_api_key"),
+        )
+
+        # SQL security patterns
+        self.dangerous_patterns = [
+            r'\bDROP\b', r'\bDELETE\b', r'\bUPDATE\b', r'\bINSERT\b',
+            r'\bALTER\b', r'\bCREATE\b', r'\bTRUNCATE\b', r'\bGRANT\b',
+            r'\bREVOKE\b', r'\bEXEC\b', r'\bEXECUTE\b'
+        ]
+
+        self.graph = self._build_graph()
+        self._schema_cache = {}
+        self._last_schema_update = None
+
+    async def initialize(self) -> None:
+        """Initialize the LangGraph agent."""
+        await self._refresh_schema_cache()
+
+    async def cleanup(self) -> None:
+        """Cleanup LangGraph agent resources."""
+        self._schema_cache.clear()
+
+    async def start(self) -> None:
+        """Start the LangGraph agent."""
+        self.logger.info("Starting LangGraph agent")
+        await self.initialize()
+        self.is_running = True
+        self.logger.info("LangGraph agent started successfully")
+
+    async def stop(self) -> None:
+        """Stop the LangGraph agent."""
+        self.logger.info("Stopping LangGraph agent")
+        self.is_running = False
+        await self.cleanup()
+        self.logger.info("LangGraph agent stopped successfully")
+
+    def _build_graph(self) -> StateGraph:
+        """Build the simplified LangGraph workflow."""
+        workflow = StateGraph(GraphState)
+
+        # Add nodes in logical order
+        workflow.add_node("analyze_query", self._analyze_query)
+        workflow.add_node("generate_sql", self._generate_sql)
+        workflow.add_node("execute_sql", self._execute_sql)
+        workflow.add_node("format_response", self._format_response)
+        workflow.add_node("handle_error", self._handle_error)
+
+        # Set entry point
+        workflow.set_entry_point("analyze_query")
+
+        # Define routing logic
+        workflow.add_conditional_edges(
+            "analyze_query",
+            self._route_after_analysis,
+            {
+                "generate_sql": "generate_sql",
+                "format_response": "format_response",
+                "error": "handle_error",
+            }
+        )
+
+        workflow.add_conditional_edges(
+            "generate_sql",
+            self._route_after_generation,
+            {
+                "execute_sql": "execute_sql",
+                "retry": "generate_sql",
+                "error": "handle_error",
+            }
+        )
+
+        workflow.add_conditional_edges(
+            "execute_sql",
+            self._route_after_execution,
+            {
+                "format_response": "format_response",
+                "retry": "generate_sql",
+                "error": "handle_error",
+            }
+        )
+
+        workflow.add_edge("format_response", END)
+        workflow.add_edge("handle_error", END)
+
+        return workflow.compile()
+
+    async def _refresh_schema_cache(self) -> None:
+        """Refresh the database schema cache with healthcare-specific information."""
+        try:
+            # Healthcare-specific schema information
+            self._schema_cache = {
+                "patients": {
+                    "description": "Patient demographic and contact information",
+                    "columns": [
+                        {"name": "patient_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "first_name", "type": "character varying", "nullable": False, "default": None},
+                        {"name": "last_name", "type": "character varying", "nullable": False, "default": None},
+                        {"name": "date_of_birth", "type": "date", "nullable": False, "default": None},
+                        {"name": "gender", "type": "character varying", "nullable": False, "default": None},
+                        {"name": "phone", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "email", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "address", "type": "text", "nullable": True, "default": None},
+                        {"name": "emergency_contact_name", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "emergency_contact_phone", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "insurance_provider", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "insurance_policy_number", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "created_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"},
+                        {"name": "updated_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"}
+                    ]
+                },
+                "doctors": {
+                    "description": "Healthcare provider information",
+                    "columns": [
+                        {"name": "doctor_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "first_name", "type": "character varying", "nullable": False, "default": None},
+                        {"name": "last_name", "type": "character varying", "nullable": False, "default": None},
+                        {"name": "specialty", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "license_number", "type": "character varying", "nullable": False, "default": None},
+                        {"name": "phone", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "email", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "department", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "hire_date", "type": "date", "nullable": True, "default": None},
+                        {"name": "is_active", "type": "boolean", "nullable": False, "default": "true"},
+                        {"name": "created_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"}
+                    ]
+                },
+                "appointments": {
+                    "description": "Medical appointment scheduling",
+                    "columns": [
+                        {"name": "appointment_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "patient_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "doctor_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "appointment_date", "type": "date", "nullable": False, "default": None},
+                        {"name": "appointment_time", "type": "time without time zone", "nullable": False, "default": None},
+                        {"name": "duration_minutes", "type": "integer", "nullable": False, "default": "30"},
+                        {"name": "appointment_type", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "status", "type": "character varying", "nullable": False, "default": "'Scheduled'::character varying"},
+                        {"name": "reason_for_visit", "type": "text", "nullable": True, "default": None},
+                        {"name": "notes", "type": "text", "nullable": True, "default": None},
+                        {"name": "created_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"},
+                        {"name": "updated_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"}
+                    ]
+                },
+                "diagnoses": {
+                    "description": "Medical diagnoses and conditions",
+                    "columns": [
+                        {"name": "diagnosis_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "patient_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "doctor_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "appointment_id", "type": "integer", "nullable": True, "default": None},
+                        {"name": "diagnosis_code", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "diagnosis_description", "type": "text", "nullable": True, "default": None},
+                        {"name": "severity", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "diagnosis_date", "type": "date", "nullable": False, "default": "CURRENT_DATE"},
+                        {"name": "notes", "type": "text", "nullable": True, "default": None},
+                        {"name": "created_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"}
+                    ]
+                },
+                "prescriptions": {
+                    "description": "Medication prescriptions",
+                    "columns": [
+                        {"name": "prescription_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "patient_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "doctor_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "appointment_id", "type": "integer", "nullable": True, "default": None},
+                        {"name": "medication_name", "type": "character varying", "nullable": False, "default": None},
+                        {"name": "dosage", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "frequency", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "duration_days", "type": "integer", "nullable": True, "default": None},
+                        {"name": "instructions", "type": "text", "nullable": True, "default": None},
+                        {"name": "prescription_date", "type": "date", "nullable": False, "default": "CURRENT_DATE"},
+                        {"name": "status", "type": "character varying", "nullable": False, "default": "'Active'::character varying"},
+                        {"name": "created_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"}
+                    ]
+                },
+                "vital_signs": {
+                    "description": "Patient vital signs and measurements",
+                    "columns": [
+                        {"name": "vital_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "patient_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "appointment_id", "type": "integer", "nullable": True, "default": None},
+                        {"name": "measurement_date", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"},
+                        {"name": "blood_pressure_systolic", "type": "integer", "nullable": True, "default": None},
+                        {"name": "blood_pressure_diastolic", "type": "integer", "nullable": True, "default": None},
+                        {"name": "heart_rate", "type": "integer", "nullable": True, "default": None},
+                        {"name": "temperature", "type": "numeric", "nullable": True, "default": None},
+                        {"name": "weight_kg", "type": "numeric", "nullable": True, "default": None},
+                        {"name": "height_cm", "type": "numeric", "nullable": True, "default": None},
+                        {"name": "bmi", "type": "numeric", "nullable": True, "default": None},
+                        {"name": "oxygen_saturation", "type": "integer", "nullable": True, "default": None},
+                        {"name": "notes", "type": "text", "nullable": True, "default": None}
+                    ]
+                },
+                "lab_results": {
+                    "description": "Laboratory test results",
+                    "columns": [
+                        {"name": "lab_result_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "patient_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "appointment_id", "type": "integer", "nullable": True, "default": None},
+                        {"name": "test_name", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "test_category", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "result_value", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "unit", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "reference_range", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "is_abnormal", "type": "boolean", "nullable": True, "default": None},
+                        {"name": "test_date", "type": "date", "nullable": True, "default": None},
+                        {"name": "notes", "type": "text", "nullable": True, "default": None},
+                        {"name": "created_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"}
+                    ]
+                },
+                "medical_history": {
+                    "description": "Patient medical history and past conditions",
+                    "columns": [
+                        {"name": "history_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "patient_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "condition_name", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "diagnosis_date", "type": "date", "nullable": True, "default": None},
+                        {"name": "status", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "severity", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "treatment", "type": "text", "nullable": True, "default": None},
+                        {"name": "notes", "type": "text", "nullable": True, "default": None},
+                        {"name": "created_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"}
+                    ]
+                },
+                "medication_history": {
+                    "description": "Patient medication history",
+                    "columns": [
+                        {"name": "med_history_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "patient_id", "type": "integer", "nullable": False, "default": None},
+                        {"name": "medication_name", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "dosage", "type": "character varying", "nullable": True, "default": None},
+                        {"name": "start_date", "type": "date", "nullable": True, "default": None},
+                        {"name": "end_date", "type": "date", "nullable": True, "default": None},
+                        {"name": "reason", "type": "text", "nullable": True, "default": None},
+                        {"name": "prescribed_by", "type": "integer", "nullable": True, "default": None},
+                        {"name": "created_at", "type": "timestamp without time zone", "nullable": False, "default": "CURRENT_TIMESTAMP"}
+                    ]
+                }
+            }
+
+            self._last_schema_update = datetime.now()
+            self.logger.info("Healthcare schema cache refreshed with detailed table information")
+
+        except Exception as e:
+            self.logger.error(f"Failed to refresh schema cache: {str(e)}")
+            # Fallback schema with basic healthcare tables
+            self._schema_cache = {
+                'patients': {'description': 'Patient information', 'columns': []},
+                'doctors': {'description': 'Doctor information', 'columns': []},
+                'appointments': {'description': 'Medical appointments', 'columns': []},
+                'diagnoses': {'description': 'Medical diagnoses', 'columns': []},
+                'prescriptions': {'description': 'Medication prescriptions', 'columns': []},
+                'vital_signs': {'description': 'Vital signs measurements', 'columns': []},
+                'lab_results': {'description': 'Laboratory test results', 'columns': []},
+                'medical_history': {'description': 'Medical history', 'columns': []},
+                'medication_history': {'description': 'Medication history', 'columns': []}
+            }
+
+    def _validate_sql_query(self, sql_query: str) -> None:
+        """
+        Validate SQL query for security and complexity.
+        
+        Args:
+            sql_query: The SQL query to validate
+            
+        Raises:
+            SQLValidationError: If query contains dangerous operations
+            QueryComplexityError: If query is too complex
+        """
+        query_upper = sql_query.upper().strip()
+        
+        # Check if it's a SELECT query
+        if not query_upper.startswith('SELECT'):
+            raise SQLValidationError("Only SELECT queries are allowed")
+        
+        # Check for dangerous patterns
+        for pattern in self.dangerous_patterns:
+            if re.search(pattern, query_upper, re.IGNORECASE):
+                raise SQLValidationError(f"Query contains forbidden operation: {pattern}")
+        
+        # Check complexity limits
+        join_count = query_upper.count('JOIN')
+        if join_count > 5:
+            raise QueryComplexityError(f"Query too complex: {join_count} JOINs (max 5)")
+        
+        subquery_count = query_upper.count('SELECT') - 1
+        if subquery_count > 3:
+            raise QueryComplexityError(f"Too many subqueries: {subquery_count} (max 3)")
+
+    def _analyze_query(self, state: GraphState) -> GraphState:
+        """Analyze user query to determine if it needs database access."""
+        try:
+            user_query = state["user_query"]
+            query_lower = user_query.lower()
+
+            # Enhanced classification logic
+            db_indicators = {
+                'high_confidence': [
+                    'show me', 'list all', 'find all', 'get all', 'retrieve all',
+                    'how many', 'count of', 'number of', 'total number',
+                    'what are the', 'which records', 'display all',
+                    'search for', 'look up', 'query for', 'fetch',
+                    'database', 'table', 'records', 'entries', 'data from'
+                ],
+                'medium_confidence': [
+                    'show', 'list', 'find', 'get', 'retrieve', 'count',
+                    'what are', 'which', 'when did', 'latest', 'recent',
+                    'who has', 'where is', 'how much'
+                ],
+                'low_confidence': [
+                    'tell me', 'what is', 'how do', 'explain', 'describe',
+                    'what are', 'who is', 'when is', 'where is'
+                ]
+            }
+
+            # Check for high confidence indicators
+            # Check for high confidence indicators (word boundaries)
+            high_matches = 0
+            for indicator in db_indicators['high_confidence']:
+                if f" {indicator} " in f" {query_lower} " or query_lower.startswith(indicator + " ") or query_lower.endswith(" " + indicator):
+                    high_matches += 1
+            
+            # Check for medium confidence indicators (word boundaries)
+            medium_matches = 0
+            for indicator in db_indicators['medium_confidence']:
+                if f" {indicator} " in f" {query_lower} " or query_lower.startswith(indicator + " ") or query_lower.endswith(" " + indicator):
+                    medium_matches += 1
+
+            # Check for general question patterns
+            general_patterns = [
+                'weather', 'time', 'date', 'how are you', 'what can you do',
+                'explain', 'describe', 'tell me about', 'what is',
+                'how does', 'why does', 'when should', 'where can'
+            ]
+
+            general_matches = 0
+            for pattern in general_patterns:
+                if f" {pattern} " in f" {query_lower} " or query_lower.startswith(pattern + " ") or query_lower.endswith(" " + pattern):
+                    general_matches += 1
+
+            # Decision logic
+            if high_matches >= 1:
+                needs_db = True
+                confidence = "high"
+            elif medium_matches >= 2:
+                needs_db = True
+                confidence = "medium"
+            elif general_matches >= 1 and high_matches == 0 and medium_matches <= 1:
+                needs_db = False
+                confidence = "general"
+            else:
+                # Ambiguous case - default to database for now
+                needs_db = True
+                confidence = "ambiguous"
+
+            self.logger.info(f"Query analysis: '{user_query}' -> needs_db={needs_db}, confidence={confidence}")
+
+            if not needs_db:
+                # Provide helpful response for general queries
+                if 'weather' in query_lower:
+                    direct_response = "I'm a healthcare database assistant and don't have access to weather information. For weather queries, please use a general AI assistant or weather service."
+                elif 'time' in query_lower or 'date' in query_lower:
+                    from datetime import datetime
+                    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    direct_response = f"Current date and time: {current_time}. For general questions, please use the 'langchain' agent type."
+                else:
+                    direct_response = (
+                        f"I understand you're asking about '{user_query}'. "
+                        f"This appears to be a general question that doesn't require database access. "
+                        f"For general AI assistance, please use the 'langchain' agent type."
+                    )
+
+                return {
+                    **state,
+                    "needs_db_access": False,
+                    "final_response": direct_response,
+                    "query_type": "general",
+                    "confidence": confidence,
+                }
+
+            return {
+                **state,
+                "needs_db_access": True,
+                "query_type": "database",
+                "confidence": confidence,
+                "attempt_count": 0,
+            }
+
+        except Exception as e:
+            return {
+                **state,
+                "error": f"Query analysis failed: {str(e)}",
+            }
+
+    def _generate_sql(self, state: GraphState) -> GraphState:
+        """Generate SQL query from natural language."""
+        try:
+            user_query = state["user_query"]
+            attempt_count = state.get("attempt_count", 0)
+            previous_error = state.get("error")
+            
+            # Get schema information
+            schema_info = self._format_schema_for_prompt()
+            
+            # Build the prompt
+            sql_prompt = f"""
+You are an expert SQL query generator. Generate a PostgreSQL-compatible SELECT query for this request.
+
+User Query: {user_query}
+
+Available Database Schema:
+{schema_info}
+
+Requirements:
+1. Use only SELECT statements
+2. Reference only existing tables and columns
+3. Use proper PostgreSQL syntax
+4. Include appropriate WHERE clauses for filtering
+5. Limit results to reasonable numbers
+6. Use table aliases for readability
+
+{f"Previous attempt failed with error: {previous_error}. Please fix the query." if previous_error and attempt_count > 0 else ""}
+
+Return only the SQL query without markdown formatting or explanations.
+            """.strip()
+
+            response = self.llm.invoke([HumanMessage(content=sql_prompt)])
+            sql_query = self._clean_sql_query(response.content)
+            
+            # Validate the query
+            self._validate_sql_query(sql_query)
+            
+            # Add LIMIT if not present
+            if 'LIMIT' not in sql_query.upper():
+                sql_query += f' LIMIT {self.result_limit}'
+            
+            self.logger.info(f"Generated SQL (attempt {attempt_count + 1}): {sql_query}")
+            
+            return {
+                **state,
+                "sql_query": sql_query,
+                "error": None,  # Clear previous errors
+            }
+            
+        except (SQLValidationError, QueryComplexityError) as e:
+            return {
+                **state,
+                "error": f"SQL validation failed: {str(e)}",
+            }
+        except Exception as e:
+            self.logger.error(f"SQL generation error: {str(e)}")
+            return {
+                **state,
+                "error": f"SQL generation failed: {str(e)}",
+            }
+
+    def _clean_sql_query(self, raw_query: str) -> str:
+        """Clean and format SQL query."""
+        # Remove markdown formatting
+        query = raw_query.strip()
+        if query.startswith("```sql"):
+            query = query[6:]
+        elif query.startswith("```"):
+            query = query[3:]
+        if query.endswith("```"):
+            query = query[:-3]
+
+        # Clean up whitespace and ensure single statement
+        query = query.strip()
+        if ';' in query:
+            query = query.split(';')[0].strip()
+
+        return query
+
+    def _format_schema_for_prompt(self) -> str:
+        """Format schema cache for LLM prompt."""
+        if not self._schema_cache:
+            return "No schema information available."
+        
+        schema_parts = []
+        for table_name, table_info in self._schema_cache.items():
+            columns = table_info.get('columns', [])
+            if columns:
+                column_descriptions = []
+                for col in columns[:10]:  # Limit columns shown
+                    col_desc = f"{col['name']} ({col['type']})"
+                    if not col.get('nullable', True):
+                        col_desc += " NOT NULL"
+                    column_descriptions.append(col_desc)
+                
+                schema_parts.append(f"Table '{table_name}': {', '.join(column_descriptions)}")
+            else:
+                schema_parts.append(f"Table '{table_name}': (columns not detailed)")
+        
+        return "\n".join(schema_parts[:20])  # Limit tables shown
+
+    async def _execute_sql(self, state: GraphState) -> GraphState:
+        """Execute the generated SQL query."""
+        try:
+            sql_query = state.get("sql_query")
+            if not sql_query:
+                return {**state, "error": "No SQL query to execute"}
+
+            # Execute the query using Prisma service
+            results = await self.prisma_service.execute_raw_query(sql_query)
+            
+            self.logger.info(f"Query executed successfully: {len(results)} rows returned")
+            
+            return {
+                **state,
+                "query_results": results,
+                "error": None,  # Clear any previous errors
+            }
+            
+        except Exception as e:
+            error_msg = str(e)
+            self.logger.error(f"SQL execution error: {error_msg}")
+            
+            # Check if this is a retryable error
+            retryable_errors = ['column', 'table', 'relation', 'syntax error']
+            is_retryable = any(keyword in error_msg.lower() for keyword in retryable_errors)
+            
+            return {
+                **state,
+                "error": f"Query execution failed: {error_msg}",
+                "retryable": is_retryable,
+            }
+
+    def _format_response(self, state: GraphState) -> GraphState:
+        """Format query results or direct response into natural language."""
+        try:
+            user_query = state["user_query"]
+            query_results = state.get("query_results")
+            final_response = state.get("final_response")
+            
+            # If we already have a direct response, use it
+            if final_response:
+                return {
+                    **state,
+                    "messages": state["messages"] + [AIMessage(content=final_response)],
+                }
+            
+            # Format database results
+            if query_results is not None:
+                if not query_results:
+                    response = f"I executed a query for '{user_query}' but found no matching results in the database."
+                else:
+                    # Format results for LLM
+                    results_summary = self._summarize_results(query_results)
+                    
+                    format_prompt = f"""
+Format these database query results into a clear, natural language response:
+
+Original Question: {user_query}
+Query Results Summary: {results_summary}
+
+Requirements:
+1. Answer the user's question directly
+2. Present data in an organized, readable format
+3. Include relevant numbers and details
+4. If there are many results, summarize the key findings
+5. Be conversational and helpful
+
+Provide a complete response that directly answers the user's question.
+                    """.strip()
+
+                    response_msg = self.llm.invoke([HumanMessage(content=format_prompt)])
+                    response = response_msg.content.strip()
+            else:
+                response = "I apologize, but I couldn't retrieve the requested information from the database."
+            
+            return {
+                **state,
+                "final_response": response,
+                "messages": state["messages"] + [AIMessage(content=response)],
+            }
+            
+        except Exception as e:
+            error_msg = f"Error formatting response: {str(e)}"
+            self.logger.error(error_msg)
+            return {
+                **state,
+                "error": error_msg,
+            }
+
+    def _summarize_results(self, results: List[Dict[str, Any]]) -> str:
+        """Create a concise summary of query results for the LLM."""
+        if not results:
+            return "No results found."
+        
+        result_count = len(results)
+        
+        if result_count == 1:
+            return f"One result: {results}"
+        
+        # Show structure and sample data
+        sample_size = min(3, result_count)
+        sample_results = results[:sample_size]
+        
+        # Get column names from first result
+        if results and len(results) > 0:
+            columns = list(results[0].keys())
+            column_info = f"Columns: {', '.join(columns)}"
+        else:
+            column_info = "No column information available"
+        
+        summary_parts = [
+            f"Found {result_count} results",
+            column_info,
+            f"Sample data: {sample_results}"
+        ]
+        
+        if result_count > sample_size:
+            summary_parts.append(f"... and {result_count - sample_size} more results")
+        
+        return "\n".join(summary_parts)
+
+    def _handle_error(self, state: GraphState) -> GraphState:
+        """Handle errors in the workflow."""
+        error = state.get("error") or "An unexpected error occurred"
+        self.logger.error(f"Workflow error: {error}")
+
+        # Create user-friendly error message
+        if error and "validation failed" in error.lower():
+            user_error = "I can only process safe database queries. Please rephrase your request."
+        elif error and "execution failed" in error.lower():
+            user_error = "I encountered an issue while querying the database. Please try rephrasing your question."
+        else:
+            user_error = "I apologize, but I encountered an error processing your request. Please try again."
+
+        return {
+            **state,
+            "final_response": user_error,
+            "messages": state["messages"] + [AIMessage(content=user_error)],
+        }
+
+    # Routing functions
+    def _route_after_analysis(self, state: GraphState) -> str:
+        """Route after query analysis."""
+        if state.get("error"):
+            return "error"
+        if state.get("needs_db_access"):
+            return "generate_sql"
+        return "format_response"
+
+    def _route_after_generation(self, state: GraphState) -> str:
+        """Route after SQL generation."""
+        if state.get("error"):
+            attempt_count = state.get("attempt_count", 0)
+            error_msg = state.get("error") or ""
+            if attempt_count < self.max_attempts and "validation failed" not in error_msg.lower():
+                return "retry"
+            return "error"
+        return "execute_sql"
+
+    def _route_after_execution(self, state: GraphState) -> str:
+        """Route after SQL execution."""
+        if state.get("error"):
+            attempt_count = state.get("attempt_count", 0)
+            is_retryable = state.get("retryable", False)
+            
+            if attempt_count < self.max_attempts and is_retryable:
+                return "retry"
+            return "error"
+        return "format_response"
+
+    async def run(self, query: str) -> str:
+        """Run the LangGraph workflow for a natural language query."""
+        try:
+            if not self.is_running:
+                raise RuntimeError("LangGraph agent is not running")
+
+            # Check if schema cache needs refresh (every hour)
+            if (self._last_schema_update is None or 
+                (datetime.now() - self._last_schema_update).seconds > 3600):
+                await self._refresh_schema_cache()
+
+            # Initialize state
+            initial_state: GraphState = {
+                "messages": [HumanMessage(content=query)],
+                "user_query": query,
+                "needs_db_access": None,
+                "sql_query": None,
+                "query_results": None,
+                "final_response": None,
+                "error": None,
+                "attempt_count": 0,
+                "query_type": None,
+                "confidence": None,
+                "retryable": None,
+            }
+
+            # Run the graph
+            final_state = await self.graph.ainvoke(initial_state)
+
+            # Extract and return the final response
+            if final_state.get("final_response"):
+                return final_state["final_response"]
+            elif final_state.get("error"):
+                return f"Error: {final_state['error']}"
+            else:
+                return "I apologize, but I couldn't process your request."
+
+        except Exception as e:
+            self.logger.error(f"Critical error in LangGraph agent: {str(e)}")
+            return f"A critical error occurred while processing your query: {str(e)}"
+
+    def get_status(self) -> Dict[str, Any]:
+        """Get agent status with additional metrics."""
+        return {
+            "name": "langgraph_agent",
+            "running": self.is_running,
+            "type": "natural_language_to_sql",
+            "capabilities": [
+                "natural_language_queries", 
+                "sql_generation", 
+                "result_formatting",
+                "query_validation",
+                "error_recovery"
+            ],
+            "schema_cache_size": len(self._schema_cache),
+            "last_schema_update": self._last_schema_update.isoformat() if self._last_schema_update else None,
+            "max_attempts": self.max_attempts,
+            "result_limit": self.result_limit,
+        }
+
+    async def health_check(self) -> Dict[str, Any]:
+        """Perform a health check of the agent."""
+        try:
+            # Test database connectivity
+            test_query = "SELECT 1 as health_check"
+            await self.db_service.execute_query(test_query)
+            db_healthy = True
+        except Exception as e:
+            db_healthy = False
+            self.logger.error(f"Database health check failed: {str(e)}")
+
+        return {
+            "agent_running": self.is_running,
+            "database_healthy": db_healthy,
+            "schema_cache_loaded": len(self._schema_cache) > 0,
+            "llm_configured": self.llm is not None,
+        }

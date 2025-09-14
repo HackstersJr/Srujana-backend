@@ -1,0 +1,59 @@
+# Updated LangChain components
+langchain==0.3.27
+langchain-community==0.3.29
+langchain-core==0.3.75
+langchain-openai>=0.2.0,<0.3.0  # Downgrade for stability
+langchain-postgres>=0.0.13,<0.1  # Upgrade to compatible version
+langsmith==0.3.45
+
+# LangGraph for advanced agent workflows
+langgraph==0.2.22
+
+# Google Gemini API
+langchain-google-genai==2.0.1
+# Vector databases and embeddings
+embedchain==0.1.128
+nanopq==0.1.1
+scipy==1.13.1  # Required by nanopq
+chromadb>=0.5.10,<0.6.0  # <-- UPDATE THIS LINE
+faiss-cpu==1.8.0
+
+# Database
+psycopg2-binary==2.9.9
+sqlalchemy==2.0.34
+asyncpg==0.29.0  # Async PostgreSQL driver
+alembic==1.13.2
+prisma==0.13.1  # Prisma Client Python
+
+# Web framework (for API endpoints)
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# Environment and configuration
+python-dotenv==1.0.1
+pydantic==2.9.2
+pydantic-settings==2.10.1
+
+# Utilities
+requests==2.32.5
+aiohttp==3.10.5
+numpy==1.26.4
+pandas==2.2.2
+
+# Logging and monitoring
+structlog==24.4.0
+rich==13.8.1
+
+# Testing
+pytest==8.3.3
+pytest-asyncio==0.24.0
+pytest-cov==5.0.0
+
+# Development tools
+black==24.8.0
+flake8==7.1.1
+isort==5.13.2
+mypy==1.11.2
+
+# Docker health check
+httpx==0.27.2
