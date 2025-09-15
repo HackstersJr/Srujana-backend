@@ -149,9 +149,122 @@ class MedicineAgent(BaseAgent):
         return response
 
     async def _handle_query(self, query: str) -> str:
-        """Handle general medicine queries by delegating to database agent."""
+        """Handle general medicine queries with multi-layered search and summarization."""
         if not self.database_agent:
             return "Database agent not available for queries."
 
-        # Delegate to database agent with the query
-        return await self.database_agent.run(query)
+        # Layer 1: Try database agent's SQL generation
+        db_result = await self.database_agent.run(query)
+        db_success = not ("No results found" in db_result or "no results" in db_result.lower())
+
+        # Layer 2: Try flexible keyword search
+        keyword_results = await self._perform_keyword_search(query)
+
+        # Layer 3: Combine and summarize results
+        return await self._combine_and_summarize_results(query, db_result, db_success, keyword_results)
+
+    def _extract_medicine_keywords(self, query: str) -> List[str]:
+        """Extract relevant keywords from medicine queries."""
+        # Common medicine-related keywords to filter out
+        stop_words = {'medicines', 'medicine', 'drugs', 'drug', 'show', 'me', 'available', 'for', 'what', 'are', 'the', 'list', 'find', 'search', 'get', 'display', 'give'}
+
+        # Split query into words and filter
+        words = query.lower().split()
+        keywords = [word for word in words if word not in stop_words and len(word) > 2]
+
+        return keywords
+
+    async def _perform_keyword_search(self, query: str) -> List[Dict[str, Any]]:
+        """Perform flexible keyword search across medicine data."""
+        keywords = self._extract_medicine_keywords(query)
+
+        if not keywords:
+            return []
+
+        # Search in medicine names, descriptions, and categories
+        search_conditions = []
+        for keyword in keywords:
+            search_conditions.extend([
+                f"\"productName\" ILIKE '%{keyword}%'",
+                f"\"subCategory\" ILIKE '%{keyword}%'",
+                f"\"medicineDesc\" ILIKE '%{keyword}%'"
+            ])
+
+        if search_conditions:
+            where_clause = " OR ".join(search_conditions)
+            search_query = f"SELECT \"productName\", \"subCategory\", \"medicineDesc\" FROM medicines WHERE {where_clause} LIMIT 15"
+            return await self.database_agent.query_database(search_query)
+
+        return []
+
+    async def _combine_and_summarize_results(self, query: str, db_result: str, db_success: bool, keyword_results: List[Dict[str, Any]]) -> str:
+        """Combine results from different layers and provide a summarized response."""
+        try:
+            # Collect all medicines found
+            all_medicines = []
+            medicine_details = {}
+
+            # Process database agent results
+            if db_success and "Found" in db_result:
+                # Extract medicine names from the formatted response
+                lines = db_result.split('\n')
+                for line in lines:
+                    if line.strip().startswith('•') or line.strip().startswith('-'):
+                        medicine_name = line.strip().lstrip('•- ').split('(')[0].strip()
+                        if medicine_name and medicine_name != "Unknown":
+                            all_medicines.append(medicine_name)
+
+            # Process keyword search results
+            for row in keyword_results:
+                medicine_name = row.get('productName', '')
+                if medicine_name and medicine_name not in all_medicines:
+                    all_medicines.append(medicine_name)
+                    medicine_details[medicine_name] = {
+                        'category': row.get('subCategory', ''),
+                        'description': row.get('medicineDesc', '')[:150] + '...' if row.get('medicineDesc', '') else ''
+                    }
+
+            # If we have results, create a summarized response
+            if all_medicines:
+                # Group by category for better organization
+                category_groups = {}
+                for medicine in all_medicines[:10]:  # Limit to top 10
+                    category = medicine_details.get(medicine, {}).get('category', 'General Medicines')
+                    if category not in category_groups:
+                        category_groups[category] = []
+                    category_groups[category].append(medicine)
+
+                # Create summarized response
+                response = f"📋 **Medicine Search Results for '{query}'**\n\n"
+
+                for category, medicines in category_groups.items():
+                    response += f"**{category}:**\n"
+                    for medicine in medicines[:5]:  # Limit per category
+                        response += f"• {medicine}\n"
+                    if len(medicines) > 5:
+                        response += f"• ... and {len(medicines) - 5} more\n"
+                    response += "\n"
+
+                total_found = len(all_medicines)
+                if total_found > 10:
+                    response += f"💡 Found {total_found} medicines total. Showing top results by category.\n"
+
+                return response
+
+            # If no results found, provide helpful fallback
+            fallback_query = "SELECT \"subCategory\", COUNT(*) as count FROM medicines GROUP BY \"subCategory\" ORDER BY count DESC LIMIT 5"
+            category_stats = await self.database_agent.query_database(fallback_query)
+
+            if category_stats:
+                response = f"I couldn't find specific medicines for '{query}', but here are the main medicine categories available:\n\n"
+                for row in category_stats:
+                    response += f"• {row['subCategory']}: {row['count']} medicines\n"
+                response += f"\n💡 Try searching for specific categories or medicine names."
+                return response
+
+            return f"No medicines found matching '{query}' in the database."
+
+        except Exception as e:
+            self.logger.error(f"Error combining results: {str(e)}")
+            # Fallback to original db_result if combination fails
+            return db_result if db_success else f"Error processing query '{query}': {str(e)}"

@@ -8,7 +8,7 @@ from services.prisma_service import PrismaService
 async def check_table_structure():
     service = PrismaService()
     await service.connect()
-    
+
     try:
         # Check the table structure
         query = "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'doctors' ORDER BY ordinal_position"

@@ -47,7 +47,7 @@ class DatabaseAgent(BaseAgent):
 
     async def run(self, input_data: Any) -> str:
         """
-        Run the Database Agent with input data.
+        Run the Database Agent with input data and retry logic.
 
         Args:
             input_data: Input data for the agent
@@ -61,17 +61,43 @@ class DatabaseAgent(BaseAgent):
             if not isinstance(input_data, str):
                 input_data = str(input_data)
 
-            # Analyze the request and generate SQL
-            sql_query = await self._generate_sql(input_data)
+            # Try up to 5 times with schema inspection on failures
+            max_retries = 5
+            last_error = None
 
-            if not sql_query:
-                return f"Could not generate SQL query for: {input_data}"
+            for attempt in range(max_retries):
+                try:
+                    self.logger.info(f"Attempt {attempt + 1}/{max_retries} for query: {input_data}")
 
-            # Execute the query
-            result = await self._execute_sql(sql_query)
+                    # On retry attempts, include schema inspection
+                    if attempt > 0:
+                        schema_info = await self._inspect_database_schema()
+                        self.logger.info(f"Schema inspection for retry: {schema_info[:500]}...")
 
-            # Format the response
-            return await self._format_response(input_data, sql_query, result)
+                    # Analyze the request and generate SQL
+                    sql_query = await self._generate_sql(input_data)
+
+                    if not sql_query:
+                        if attempt == max_retries - 1:
+                            return f"Could not generate SQL query for: {input_data}"
+                        continue
+
+                    # Execute the query
+                    result = await self._execute_sql(sql_query)
+
+                    # Format the response
+                    return await self._format_response(input_data, sql_query, result)
+
+                except Exception as e:
+                    last_error = str(e)
+                    self.logger.warning(f"Attempt {attempt + 1} failed: {last_error}")
+
+                    # If this is not the last attempt, continue to try again
+                    if attempt < max_retries - 1:
+                        continue
+                    else:
+                        # Last attempt failed, return error
+                        return f"Query failed after {max_retries} attempts. Last error: {last_error}"
 
         except Exception as e:
             self.logger.error("Failed to run Database Agent", error=str(e))
@@ -95,51 +121,112 @@ class DatabaseAgent(BaseAgent):
             self.logger.error(f"Failed to execute query: {str(e)}")
             return []
 
+    async def _get_table_schema(self, table_name: str) -> str:
+        """Get the schema information for a specific table."""
+        try:
+            # Query to get column information
+            schema_query = f"""
+            SELECT column_name, data_type, is_nullable
+            FROM information_schema.columns
+            WHERE table_name = '{table_name}'
+            ORDER BY ordinal_position
+            """
+
+            result = await self.prisma_service.execute_raw_query(schema_query)
+
+            if not result:
+                return f"No schema information found for table '{table_name}'"
+
+            schema_info = f"TABLE: {table_name}\nCOLUMNS:\n"
+            for row in result:
+                nullable = "NULL" if row['is_nullable'] == 'YES' else "NOT NULL"
+                schema_info += f"- {row['column_name']} ({row['data_type']}, {nullable})\n"
+
+            return schema_info
+
+        except Exception as e:
+            self.logger.error(f"Failed to get schema for table {table_name}: {str(e)}")
+            return f"Error getting schema for table '{table_name}': {str(e)}"
+
+    async def _inspect_database_schema(self) -> str:
+        """Inspect the database schema and return information about all tables."""
+        try:
+            # Get all table names
+            tables_query = """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = 'public'
+            AND table_type = 'BASE TABLE'
+            ORDER BY table_name
+            """
+
+            tables_result = await self.prisma_service.execute_raw_query(tables_query)
+
+            if not tables_result:
+                return "No tables found in database"
+
+            schema_info = "DATABASE SCHEMA INSPECTION:\n\n"
+
+            for table_row in tables_result:
+                table_name = table_row['table_name']
+                table_schema = await self._get_table_schema(table_name)
+                schema_info += table_schema + "\n"
+
+            return schema_info
+
+        except Exception as e:
+            self.logger.error(f"Failed to inspect database schema: {str(e)}")
+            return f"Error inspecting database schema: {str(e)}"
+
     async def _generate_sql(self, request: str) -> Optional[str]:
         """Generate SQL query from natural language request."""
-        prompt = (
-            "Generate a PostgreSQL query for this request. Return only the SQL query, no explanations.\n\n"
-            f"Request: {request}\n"
-            "Available tables and columns (CRITICAL: Always use EXACT column names with quotes for camelCase):\n"
-            "- medicines: id, \"subCategory\", \"productName\", \"saltComposition\", \"productPrice\", \"productManufactured\", \"medicineDesc\", \"sideEffects\", \"drugInteractions\"\n"
-            "- inventory: id, \"medicineId\", \"batchNumber\", \"expiryDate\", quantity, \"unitPrice\", supplier\n"
-            "- transactions: id, \"inventoryId\", \"transactionType\", quantity, \"transactionDate\", reason, \"performedBy\"\n"
-            "- expiry_tracking: id, \"inventoryId\", \"medicineId\", \"batchNumber\", \"expiryDate\", \"currentQuantity\", status, \"alertSent\", \"alertDate\"\n"
-            "- prescriptions: id, \"patientId\", \"doctorId\", \"prescriptionDate\", notes\n"
-            "- prescription_items: id, \"prescriptionId\", \"medicineId\", dosage, frequency, duration, instructions\n"
-            "- patients: id, \"firstName\", \"lastName\", \"dateOfBirth\", gender, phone, email, address, \"emergencyContact\"\n"
-            "- doctors: id, \"firstName\", \"lastName\", specialization, \"licenseNumber\", phone, email, department, \"yearsOfExperience\"\n"
-            "\nMANDATORY RULES:\n"
-            "1. ALWAYS use double quotes around camelCase column names (e.g., \"medicineId\", \"productName\", \"expiryDate\")\n"
-            "2. NEVER use unquoted camelCase column names - this will cause PostgreSQL errors\n"
-            "3. Use lowercase column names WITHOUT quotes only for simple names like 'id', 'quantity', 'status'\n"
-            "4. Always use proper JOIN syntax with quoted column names in ON clauses\n"
-            "5. PostgreSQL requires quoted identifiers for columns with mixed case\n"
-            "\nExample of CORRECT syntax:\n"
-            "SELECT m.\"productName\", i.\"expiryDate\" FROM medicines m JOIN inventory i ON m.id = i.\"medicineId\"\n"
-            "\nExample of INCORRECT syntax (will fail):\n"
-            "SELECT m.productName, i.expiryDate FROM medicines m JOIN inventory i ON m.id = i.medicineId"
-        )
+        try:
+            # Get schema information for better SQL generation
+            schema_info = await self._inspect_database_schema()
 
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        sql_query = response.content.strip()
+            prompt = (
+                "Generate a PostgreSQL query for this request. Return only the SQL query, no explanations.\n\n"
+                f"Request: {request}\n\n"
+                f"DATABASE SCHEMA:\n{schema_info}\n\n"
+                "CRITICAL RULES - FOLLOW THESE EXACTLY:\n"
+                "1. ALWAYS use double quotes around camelCase column names: \"medicineId\", \"productName\", \"expiryDate\", \"firstName\", \"lastName\", etc.\n"
+                "2. NEVER use unquoted camelCase - PostgreSQL will treat them as lowercase and fail\n"
+                "3. Use lowercase WITHOUT quotes for: id, quantity, status, gender, phone, email, address, notes, reason, supplier\n"
+                "4. For JOINs, always use the correct foreign key relationships\n"
+                "5. Use table aliases (m, i, p, d, etc.) for readability\n\n"
+                "EXAMPLES OF CORRECT QUERIES:\n"
+                "SELECT m.\"productName\", i.\"expiryDate\", i.quantity FROM medicines m JOIN inventory i ON m.id = i.\"medicineId\" WHERE i.\"expiryDate\" < NOW()\n"
+                "SELECT p.\"firstName\", p.\"lastName\", COUNT(pr.id) as prescription_count FROM patients p LEFT JOIN prescriptions pr ON p.id = pr.\"patientId\" GROUP BY p.id, p.\"firstName\", p.\"lastName\"\n"
+                "SELECT d.\"firstName\", d.\"lastName\", d.specialization FROM doctors d\n\n"
+                "EXAMPLES OF INCORRECT QUERIES (will fail):\n"
+                "SELECT m.productName FROM medicines m  (missing quotes on productName)\n"
+                "SELECT p.name FROM patients p  (wrong column name, should be firstName/lastName)\n"
+                "SELECT m.id, medicineId FROM inventory i  (missing table alias and quotes)\n"
+            )
 
-        # Clean up the SQL
-        if sql_query.startswith("```sql"):
-            sql_query = sql_query[6:]
-        if sql_query.endswith("```"):
-            sql_query = sql_query[:-3]
-        sql_query = sql_query.strip()
+            response = self.llm.invoke([HumanMessage(content=prompt)])
+            sql_query = response.content.strip()
 
-        # Post-process SQL to ensure camelCase columns are quoted
-        sql_query = self._fix_column_quoting(sql_query)
+            # Clean up the SQL
+            if sql_query.startswith("```sql"):
+                sql_query = sql_query[6:]
+            if sql_query.endswith("```"):
+                sql_query = sql_query[:-3]
+            sql_query = sql_query.strip()
 
-        # Basic validation
-        if not sql_query.upper().startswith(("SELECT", "INSERT", "UPDATE", "DELETE")):
-            self.logger.warning(f"Generated invalid SQL: {sql_query}")
+            # Post-process SQL to ensure camelCase columns are quoted
+            sql_query = self._fix_column_quoting(sql_query)
+
+            # Basic validation
+            if not sql_query.upper().startswith(("SELECT", "INSERT", "UPDATE", "DELETE")):
+                self.logger.warning(f"Generated invalid SQL: {sql_query}")
+                return None
+
+            return sql_query
+
+        except Exception as e:
+            self.logger.error(f"Failed to generate SQL: {str(e)}")
             return None
-
-        return sql_query
 
     def _fix_column_quoting(self, sql_query: str) -> str:
         """Fix SQL query to ensure camelCase columns are properly quoted."""

@@ -68,16 +68,22 @@ services:
       DEBUG: false
       LOG_LEVEL: INFO
 
+      # Agent Coordinator settings
+      AGENT_COORDINATOR_ENABLED: true
+      AGENT_LOOP_TIMEOUT: 30
+      AGENT_RETRY_ATTEMPTS: 5
+
       # Server settings
       SERVER_HOST: 0.0.0.0
       SERVER_PORT: 8000
-      
+
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
       - ./data/input:/archive
       - ./logs:/app/logs
+      - ./agents:/app/agents
     depends_on:
       postgres:
         condition: service_healthy

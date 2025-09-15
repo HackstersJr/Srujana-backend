@@ -78,7 +78,7 @@ class LangGraphAgent(BaseAgent):
         self.toolbox_service = toolbox_service
         self.max_attempts = config.get("max_sql_attempts", 2)
         self.result_limit = config.get("result_limit", 1000)
-        
+
         self.llm = ChatGoogleGenerativeAI(
             model=config.get("model_name", "gemini-1.5-flash"),
             temperature=config.get("temperature", 0.1),
@@ -343,30 +343,30 @@ class LangGraphAgent(BaseAgent):
     def _validate_sql_query(self, sql_query: str) -> None:
         """
         Validate SQL query for security and complexity.
-        
+
         Args:
             sql_query: The SQL query to validate
-            
+
         Raises:
             SQLValidationError: If query contains dangerous operations
             QueryComplexityError: If query is too complex
         """
         query_upper = sql_query.upper().strip()
-        
+
         # Check if it's a SELECT query
         if not query_upper.startswith('SELECT'):
             raise SQLValidationError("Only SELECT queries are allowed")
-        
+
         # Check for dangerous patterns
         for pattern in self.dangerous_patterns:
             if re.search(pattern, query_upper, re.IGNORECASE):
                 raise SQLValidationError(f"Query contains forbidden operation: {pattern}")
-        
+
         # Check complexity limits
         join_count = query_upper.count('JOIN')
         if join_count > 5:
             raise QueryComplexityError(f"Query too complex: {join_count} JOINs (max 5)")
-        
+
         subquery_count = query_upper.count('SELECT') - 1
         if subquery_count > 3:
             raise QueryComplexityError(f"Too many subqueries: {subquery_count} (max 3)")
@@ -403,7 +403,7 @@ class LangGraphAgent(BaseAgent):
             for indicator in db_indicators['high_confidence']:
                 if f" {indicator} " in f" {query_lower} " or query_lower.startswith(indicator + " ") or query_lower.endswith(" " + indicator):
                     high_matches += 1
-            
+
             # Check for medium confidence indicators (word boundaries)
             medium_matches = 0
             for indicator in db_indicators['medium_confidence']:
@@ -482,10 +482,10 @@ class LangGraphAgent(BaseAgent):
             user_query = state["user_query"]
             attempt_count = state.get("attempt_count", 0)
             previous_error = state.get("error")
-            
+
             # Get schema information
             schema_info = self._format_schema_for_prompt()
-            
+
             # Build the prompt
             sql_prompt = f"""
 You are an expert SQL query generator. Generate a PostgreSQL-compatible SELECT query for this request.
@@ -510,22 +510,22 @@ Return only the SQL query without markdown formatting or explanations.
 
             response = self.llm.invoke([HumanMessage(content=sql_prompt)])
             sql_query = self._clean_sql_query(response.content)
-            
+
             # Validate the query
             self._validate_sql_query(sql_query)
-            
+
             # Add LIMIT if not present
             if 'LIMIT' not in sql_query.upper():
                 sql_query += f' LIMIT {self.result_limit}'
-            
+
             self.logger.info(f"Generated SQL (attempt {attempt_count + 1}): {sql_query}")
-            
+
             return {
                 **state,
                 "sql_query": sql_query,
                 "error": None,  # Clear previous errors
             }
-            
+
         except (SQLValidationError, QueryComplexityError) as e:
             return {
                 **state,
@@ -560,7 +560,7 @@ Return only the SQL query without markdown formatting or explanations.
         """Format schema cache for LLM prompt."""
         if not self._schema_cache:
             return "No schema information available."
-        
+
         schema_parts = []
         for table_name, table_info in self._schema_cache.items():
             columns = table_info.get('columns', [])
@@ -571,11 +571,11 @@ Return only the SQL query without markdown formatting or explanations.
                     if not col.get('nullable', True):
                         col_desc += " NOT NULL"
                     column_descriptions.append(col_desc)
-                
+
                 schema_parts.append(f"Table '{table_name}': {', '.join(column_descriptions)}")
             else:
                 schema_parts.append(f"Table '{table_name}': (columns not detailed)")
-        
+
         return "\n".join(schema_parts[:20])  # Limit tables shown
 
     async def _execute_sql(self, state: GraphState) -> GraphState:
@@ -587,23 +587,23 @@ Return only the SQL query without markdown formatting or explanations.
 
             # Execute the query using Prisma service
             results = await self.prisma_service.execute_raw_query(sql_query)
-            
+
             self.logger.info(f"Query executed successfully: {len(results)} rows returned")
-            
+
             return {
                 **state,
                 "query_results": results,
                 "error": None,  # Clear any previous errors
             }
-            
+
         except Exception as e:
             error_msg = str(e)
             self.logger.error(f"SQL execution error: {error_msg}")
-            
+
             # Check if this is a retryable error
             retryable_errors = ['column', 'table', 'relation', 'syntax error']
             is_retryable = any(keyword in error_msg.lower() for keyword in retryable_errors)
-            
+
             return {
                 **state,
                 "error": f"Query execution failed: {error_msg}",
@@ -616,14 +616,14 @@ Return only the SQL query without markdown formatting or explanations.
             user_query = state["user_query"]
             query_results = state.get("query_results")
             final_response = state.get("final_response")
-            
+
             # If we already have a direct response, use it
             if final_response:
                 return {
                     **state,
                     "messages": state["messages"] + [AIMessage(content=final_response)],
                 }
-            
+
             # Format database results
             if query_results is not None:
                 if not query_results:
@@ -631,7 +631,7 @@ Return only the SQL query without markdown formatting or explanations.
                 else:
                     # Format results for LLM
                     results_summary = self._summarize_results(query_results)
-                    
+
                     format_prompt = f"""
 Format these database query results into a clear, natural language response:
 
@@ -652,13 +652,13 @@ Provide a complete response that directly answers the user's question.
                     response = response_msg.content.strip()
             else:
                 response = "I apologize, but I couldn't retrieve the requested information from the database."
-            
+
             return {
                 **state,
                 "final_response": response,
                 "messages": state["messages"] + [AIMessage(content=response)],
             }
-            
+
         except Exception as e:
             error_msg = f"Error formatting response: {str(e)}"
             self.logger.error(error_msg)
@@ -671,32 +671,32 @@ Provide a complete response that directly answers the user's question.
         """Create a concise summary of query results for the LLM."""
         if not results:
             return "No results found."
-        
+
         result_count = len(results)
-        
+
         if result_count == 1:
             return f"One result: {results}"
-        
+
         # Show structure and sample data
         sample_size = min(3, result_count)
         sample_results = results[:sample_size]
-        
+
         # Get column names from first result
         if results and len(results) > 0:
             columns = list(results[0].keys())
             column_info = f"Columns: {', '.join(columns)}"
         else:
             column_info = "No column information available"
-        
+
         summary_parts = [
             f"Found {result_count} results",
             column_info,
             f"Sample data: {sample_results}"
         ]
-        
+
         if result_count > sample_size:
             summary_parts.append(f"... and {result_count - sample_size} more results")
-        
+
         return "\n".join(summary_parts)
 
     def _handle_error(self, state: GraphState) -> GraphState:
@@ -742,7 +742,7 @@ Provide a complete response that directly answers the user's question.
         if state.get("error"):
             attempt_count = state.get("attempt_count", 0)
             is_retryable = state.get("retryable", False)
-            
+
             if attempt_count < self.max_attempts and is_retryable:
                 return "retry"
             return "error"
@@ -755,7 +755,7 @@ Provide a complete response that directly answers the user's question.
                 raise RuntimeError("LangGraph agent is not running")
 
             # Check if schema cache needs refresh (every hour)
-            if (self._last_schema_update is None or 
+            if (self._last_schema_update is None or
                 (datetime.now() - self._last_schema_update).seconds > 3600):
                 await self._refresh_schema_cache()
 
@@ -796,8 +796,8 @@ Provide a complete response that directly answers the user's question.
             "running": self.is_running,
             "type": "natural_language_to_sql",
             "capabilities": [
-                "natural_language_queries", 
-                "sql_generation", 
+                "natural_language_queries",
+                "sql_generation",
                 "result_formatting",
                 "query_validation",
                 "error_recovery"

@@ -12,15 +12,14 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, root_validator
 from dotenv import load_dotenv
+import time
 
 # Load environment variables from .env file
 load_dotenv()
 
 from agents.langchain_agent import LangChainAgent
-from agents.langgraph_agent import LangGraphAgent
+from agents.langgraph_agent import LangGraphAgentCoordinator
 from agents.toolbox_agent import ToolboxAgent
-from agents.medicine_agent import MedicineAgent
-from agents.database_agent import DatabaseAgent
 from configs.logging_config import get_logger, setup_agent_logging
 # Import our modules
 from configs.settings import get_settings
@@ -33,7 +32,7 @@ from services.prisma_service import PrismaService
 # Global variables
 app = FastAPI()
 agent_system: Optional["AgentSystem"] = None
-logger = None
+logger = get_logger(__name__)
 
 
 class QueryRequest(BaseModel):
@@ -82,13 +81,14 @@ class AgentSystem:
         self.nanopq_retriever = None
         self.embedchain_retriever = None
 
-        # Agents
+        # Legacy agents (for backward compatibility)
         self.langchain_agent = None
         self.toolbox_agent = None
         self.langgraph_agent = None
         self.langchain_agent_secondary = None
-        self.medicine_agent = None
-        self.database_agent = None
+
+        # New LangGraph coordinator system
+        self.agent_coordinator = None
 
         self.is_running = False
 
@@ -134,8 +134,17 @@ class AgentSystem:
             )
             await self.embedchain_retriever.start()
 
-            # Initialize agents
-            self.logger.info("Initializing agents")
+            # Initialize LangGraph coordinator with all agents
+            self.logger.info("Initializing LangGraph agent coordinator")
+            self.agent_coordinator = LangGraphAgentCoordinator(
+                config=self.settings.get_llm_config(),
+                db_service=self.db_service,
+                prisma_service=self.prisma_service,
+            )
+            await self.agent_coordinator.start()
+
+            # Initialize legacy agents for backward compatibility
+            self.logger.info("Initializing legacy agents for backward compatibility")
 
             # LangChain agent
             self.langchain_agent = LangChainAgent(
@@ -156,6 +165,7 @@ class AgentSystem:
                 toolbox_service=self.toolbox_service,
             )
             await self.langchain_agent_secondary.start()
+
             # Toolbox agent
             self.toolbox_agent = ToolboxAgent(
                 config=self.settings.get_llm_config(),
@@ -164,27 +174,13 @@ class AgentSystem:
             )
             await self.toolbox_agent.start()
 
-            # LangGraph agent
-            self.langgraph_agent = LangGraphAgent(
+            # LangGraph coordinator (replaces individual agents)
+            self.agent_coordinator = LangGraphAgentCoordinator(
                 config=self.settings.get_llm_config(),
                 db_service=self.db_service,
                 prisma_service=self.prisma_service,
             )
-            await self.langgraph_agent.start()
-
-            # Database agent
-            self.database_agent = DatabaseAgent(
-                config=self.settings.get_llm_config(),
-                prisma_service=self.prisma_service,
-            )
-            await self.database_agent.start()
-
-            # Medicine agent
-            self.medicine_agent = MedicineAgent(
-                config=self.settings.get_llm_config(),
-                database_agent=self.database_agent,
-            )
-            await self.medicine_agent.start()
+            await self.agent_coordinator.start()
 
             self.is_running = True
             self.logger.info("Agent system initialized successfully")
@@ -198,24 +194,23 @@ class AgentSystem:
         try:
             self.logger.info("Shutting down agent system")
 
-            # Shutdown agents
+            # Shutdown agent coordinator
+            if self.agent_coordinator:
+                await self.agent_coordinator.stop()
+
+            # Shutdown legacy agents
             if self.langchain_agent:
                 await self.langchain_agent.stop()
 
             if self.toolbox_agent:
                 await self.toolbox_agent.stop()
 
-            if self.langgraph_agent:
-                await self.langgraph_agent.stop()
-
             if self.langchain_agent_secondary:
                 await self.langchain_agent_secondary.stop()
 
-            if self.medicine_agent:
-                await self.medicine_agent.stop()
-
-            if self.database_agent:
-                await self.database_agent.stop()
+            # Shutdown coordinator
+            if self.agent_coordinator:
+                await self.agent_coordinator.stop()
 
             # Shutdown retrievers
             if self.nanopq_retriever:
@@ -238,53 +233,30 @@ class AgentSystem:
             self.logger.error(f"Error during shutdown: {str(e)}")
 
     async def process_query(self, message: str, agent_type: Optional[str] = None) -> tuple:
-        """Process a message using the specified agent and return (response, agent_type_used)."""
+        """Process a message using the LangGraph coordinator."""
         if not self.is_running:
             raise RuntimeError("Agent system is not running")
 
         try:
-            # If client specified agent_type, respect it
+            # If client specified agent_type, pass it through
             if agent_type:
-                if agent_type == "langchain" and self.langchain_agent:
-                    resp = await self.langchain_agent.run(message)
-                    return resp, "langchain"
-                if agent_type == "langchain_secondary" and self.langchain_agent_secondary:
-                    resp = await self.langchain_agent_secondary.run(message)
-                    return resp, "langchain_secondary"
-                if agent_type == "toolbox" and self.toolbox_agent:
-                    resp = await self.toolbox_agent.run(message)
-                    return resp, "toolbox"
-                if agent_type == "langgraph" and self.langgraph_agent:
-                    resp = await self.langgraph_agent.run(message)
-                    return resp, "langgraph"
-                raise ValueError(f"Unknown agent type: {agent_type}")
+                # For now, just route everything through the coordinator
+                # The coordinator will handle the routing internally
+                pass
 
-            # Auto-selection: simple keyword-based routing
+            # Use the LangGraph coordinator for all requests
+            if self.agent_coordinator:
+                response = await self.agent_coordinator.run(message)
+                return response, "coordinator"
+
+            # Fallback to legacy agents if coordinator is not available
             lower = (message or "").lower()
-
-            # Medicine-related requests -> MedicineAgent
-            medicine_keywords = [
-                "medicine", "medicines", "drug", "drugs", "pharmacy", "pharmaceutical",
-                "inventory", "stock", "inflow", "outflow", "expiry", "expire", "expiration",
-                "batch", "lot", "prescription", "dosage", "usage", "consumption"
-            ]
-            if any(k in lower for k in medicine_keywords):
-                if self.medicine_agent:
-                    resp = await self.medicine_agent.run(message)
-                    return resp, "medicine"
-
-            if any(k in lower for k in ["select", "show", "list", "find", "count", "where", "join"]):
-                # SQL-like request -> LangGraph
-                if self.langgraph_agent:
-                    resp = await self.langgraph_agent.run(message)
-                    return resp, "langgraph"
-
             if any(k in lower for k in ["run", "shell", "file", "open", "read", "write"]):
                 if self.toolbox_agent:
                     resp = await self.toolbox_agent.run(message)
                     return resp, "toolbox"
 
-            # Otherwise choose between primary and secondary LLM based on length/heuristic
+            # Otherwise choose between primary and secondary LLM
             if len(message or "") < 200:
                 if self.langchain_agent:
                     resp = await self.langchain_agent.run(message)
@@ -316,8 +288,6 @@ async def startup_event():
     try:
         # Setup logging
         setup_agent_logging()
-        global logger
-        logger = get_logger(__name__)
 
         logger.info("Starting CareCloud AI Agent system")
 
@@ -355,17 +325,100 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
+    """Comprehensive health check endpoint for Docker and monitoring."""
     global agent_system
 
-    if not agent_system or not agent_system.is_running:
-        raise HTTPException(status_code=503, detail="Agent system not ready")
-
-    return {
+    health_status = {
         "status": "healthy",
-        "agent_system": "running",
-        "timestamp": "2024-01-01T00:00:00Z",  # You'd use actual timestamp
+        "timestamp": time.time(),
+        "services": {},
+        "agents": {},
+        "coordinator": {}
     }
+
+    try:
+        # Check agent system
+        if not agent_system:
+            health_status["status"] = "unhealthy"
+            health_status["services"]["agent_system"] = "not_initialized"
+            return health_status
+
+        health_status["services"]["agent_system"] = "running" if agent_system.is_running else "stopped"
+
+        # Check agent coordinator
+        if agent_system.agent_coordinator:
+            try:
+                coordinator_health = await agent_system.agent_coordinator.health_check()
+                health_status["coordinator"] = coordinator_health
+
+                # If coordinator is unhealthy, mark overall status as degraded
+                if coordinator_health.get("coordinator", {}).get("status") != "healthy":
+                    health_status["status"] = "degraded"
+            except Exception as e:
+                health_status["coordinator"] = {"status": "error", "error": str(e)}
+                health_status["status"] = "degraded"
+        else:
+            health_status["coordinator"] = {"status": "not_initialized"}
+
+        # Check legacy agents
+        agent_checks = {
+            "langchain_agent": agent_system.langchain_agent,
+            "toolbox_agent": agent_system.toolbox_agent,
+            "langgraph_agent": agent_system.langgraph_agent,
+            "langchain_agent_secondary": agent_system.langchain_agent_secondary
+        }
+
+        for agent_name, agent in agent_checks.items():
+            if agent:
+                try:
+                    status = agent.get_status()
+                    health_status["agents"][agent_name] = {
+                        "status": "healthy" if status.get("is_running") else "unhealthy",
+                        "name": status.get("name")
+                    }
+                except Exception as e:
+                    health_status["agents"][agent_name] = {"status": "error", "error": str(e)}
+                    health_status["status"] = "degraded"
+            else:
+                health_status["agents"][agent_name] = {"status": "not_initialized"}
+
+        # Check services
+        service_checks = {
+            "db_service": agent_system.db_service,
+            "prisma_service": agent_system.prisma_service,
+            "toolbox_service": agent_system.toolbox_service
+        }
+
+        for service_name, service in service_checks.items():
+            if service:
+                health_status["services"][service_name] = "running"
+            else:
+                health_status["services"][service_name] = "not_initialized"
+                health_status["status"] = "degraded"
+
+        # Check retrievers
+        retriever_checks = {
+            "nanopq_retriever": agent_system.nanopq_retriever,
+            "embedchain_retriever": agent_system.embedchain_retriever
+        }
+
+        for retriever_name, retriever in retriever_checks.items():
+            if retriever:
+                try:
+                    status = retriever.get_status()
+                    health_status["services"][retriever_name] = "running" if status.get("is_running") else "stopped"
+                except Exception as e:
+                    health_status["services"][retriever_name] = "error"
+                    health_status["status"] = "degraded"
+            else:
+                health_status["services"][retriever_name] = "not_initialized"
+
+        return health_status
+
+    except Exception as e:
+        health_status["status"] = "unhealthy"
+        health_status["error"] = str(e)
+        return health_status
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -402,46 +455,6 @@ async def process_query(request: QueryRequest):
         raise HTTPException(
             status_code=500, detail=f"Query processing failed: {str(e)}"
         )
-
-
-@app.get("/agents/status")
-async def get_agents_status():
-    """Get status of all agents."""
-    global agent_system
-
-    if not agent_system:
-        raise HTTPException(status_code=503, detail="Agent system not initialized")
-
-    status = {
-        "system_running": agent_system.is_running,
-        "langchain_agent": (
-            agent_system.langchain_agent.get_status()
-            if agent_system.langchain_agent
-            else None
-        ),
-        "toolbox_agent": (
-            agent_system.toolbox_agent.get_status()
-            if agent_system.toolbox_agent
-            else None
-        ),
-        "langgraph_agent": (
-            agent_system.langgraph_agent.get_status()
-            if agent_system.langgraph_agent
-            else None
-        ),
-        "nanopq_retriever": (
-            agent_system.nanopq_retriever.get_status()
-            if agent_system.nanopq_retriever
-            else None
-        ),
-        "embedchain_retriever": (
-            agent_system.embedchain_retriever.get_status()
-            if agent_system.embedchain_retriever
-            else None
-        ),
-    }
-
-    return status
 
 
 # Configure CORS

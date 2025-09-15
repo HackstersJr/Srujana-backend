@@ -41,7 +41,7 @@ A comprehensive AI agent system built with LangChain, integrating multiple retri
    ```bash
    # On Linux/macOS
    ./scripts/deploy_docker.sh
-   
+
    # On Windows (PowerShell)
    .\scripts\deploy_docker.ps1
    ```
@@ -57,7 +57,7 @@ A comprehensive AI agent system built with LangChain, integrating multiple retri
    ```bash
    # On Linux/macOS
    ./scripts/setup_dev.sh
-   
+
    # On Windows (PowerShell)
    .\scripts\setup_dev.ps1
    ```
@@ -66,7 +66,7 @@ A comprehensive AI agent system built with LangChain, integrating multiple retri
    ```bash
    # On Linux/macOS
    source venv/bin/activate
-   
+
    # On Windows
    .\venv\Scripts\Activate.ps1
    ```
@@ -81,7 +81,7 @@ A comprehensive AI agent system built with LangChain, integrating multiple retri
    ```bash
    # Console mode
    python main.py --mode console
-   
+
    # Server mode
    python main.py --mode server
    ```
@@ -91,8 +91,15 @@ A comprehensive AI agent system built with LangChain, integrating multiple retri
 ```
 agent-project/
 ├── agents/                 # Agent implementations
+│   ├── __init__.py        # Agent module initialization
 │   ├── base_agent.py      # Base agent class
+│   ├── database_agent.py  # Database operations agent
+│   ├── medicine_agent.py  # Medicine management agent
+│   ├── patient_monitoring_agent.py # Patient monitoring agent
+│   ├── stock_management_agent.py # Stock management agent
+│   ├── appointment_agent.py # Appointment scheduling agent
 │   ├── langchain_agent.py # LangChain agent implementation
+│   ├── langgraph_agent.py # LangGraph agent implementation
 │   └── toolbox_agent.py   # Toolbox agent implementation
 ├── retrievers/            # Retriever implementations
 │   ├── base_retriever.py  # Base retriever class
@@ -170,6 +177,31 @@ curl http://localhost:8000/agents/status
 ```
 
 ## 🔍 Agent Types
+
+### Medicine Agent
+- Handles medicine inventory, stock levels, expiry tracking, and prescription management
+- Specialized for pharmaceutical operations and drug information
+- Access via `agent_type: "medicine"` or keywords like "medicine", "inventory", "prescription"
+
+### Patient Monitoring Agent
+- Monitors patient vitals, health metrics, and medical history
+- Tracks health alerts and provides preventive care recommendations
+- Access via `agent_type: "patient_monitoring"` or keywords like "patient", "vitals", "monitoring"
+
+### Stock Management Agent
+- Manages inventory levels, reorder alerts, and supplier relationships
+- Handles stock transactions and supply chain optimization
+- Access via `agent_type: "stock_management"` or keywords like "stock", "inventory", "reorder"
+
+### Appointment Agent
+- Manages appointment scheduling, rescheduling, and cancellations
+- Handles calendar management and booking coordination
+- Access via `agent_type: "appointment"` or keywords like "appointment", "schedule", "booking"
+
+### Database Agent
+- Executes SQL queries and manages database operations
+- Provides data analysis and reporting capabilities
+- Used internally by other specialized agents
 
 ### LangChain Agent
 - Uses LangChain framework for agent orchestration
@@ -345,7 +377,7 @@ For easy distribution and deployment across different environments, you can push
    # Linux/macOS
    export USERNAME=your-dockerhub-username
    ./scripts/deploy-registry.sh
-   
+
    # Windows PowerShell
    .\scripts\deploy-registry.ps1 -Username your-dockerhub-username
    ```
@@ -355,7 +387,7 @@ For easy distribution and deployment across different environments, you can push
    # Google Container Registry
    export REGISTRY=gcr.io USERNAME=your-gcp-project-id
    ./scripts/deploy-registry.sh
-   
+
    # GitHub Container Registry
    export REGISTRY=ghcr.io USERNAME=your-github-username
    ./scripts/deploy-registry.sh
@@ -365,7 +397,7 @@ For easy distribution and deployment across different environments, you can push
    ```bash
    # Pull the image
    docker pull your-registry/carecloud-agent:latest
-   
+
    # Deploy with Docker Compose
    docker-compose up -d
    ```

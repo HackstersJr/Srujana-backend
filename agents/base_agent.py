@@ -3,8 +3,9 @@ Base Agent module providing common functionality for all agents.
 """
 
 import logging
+import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 import structlog
 
@@ -29,6 +30,14 @@ class BaseAgent(ABC):
         self.config = config or {}
         self.is_running = False
         self.logger = logger.bind(agent_name=name)
+        self.request_handlers: Dict[str, Callable] = {}
+        self.response_callbacks: Dict[str, Callable] = {}
+        self.metrics = {
+            "requests_processed": 0,
+            "errors": 0,
+            "avg_processing_time": 0.0,
+            "last_request_time": None
+        }
 
     @abstractmethod
     async def initialize(self) -> None:
@@ -69,4 +78,70 @@ class BaseAgent(ABC):
 
     def get_status(self) -> Dict[str, Any]:
         """Get the current status of the agent."""
-        return {"name": self.name, "is_running": self.is_running, "config": self.config}
+        return {
+            "name": self.name,
+            "is_running": self.is_running,
+            "config": self.config,
+            "metrics": self.metrics.copy()
+        }
+
+    def register_request_handler(self, request_type: str, handler: Callable) -> None:
+        """Register a handler for a specific request type."""
+        self.request_handlers[request_type] = handler
+        self.logger.info(f"Registered handler for {request_type}", agent=self.name)
+
+    def register_response_callback(self, callback_id: str, callback: Callable) -> None:
+        """Register a callback for response handling."""
+        self.response_callbacks[callback_id] = callback
+        self.logger.info(f"Registered response callback {callback_id}", agent=self.name)
+
+    async def handle_request(self, request_type: str, data: Any) -> Any:
+        """Handle a request using registered handlers."""
+        if request_type in self.request_handlers:
+            start_time = time.time()
+            try:
+                result = await self.request_handlers[request_type](data)
+                processing_time = time.time() - start_time
+
+                # Update metrics
+                self.metrics["requests_processed"] += 1
+                self.metrics["last_request_time"] = time.time()
+                if self.metrics["requests_processed"] == 1:
+                    self.metrics["avg_processing_time"] = processing_time
+                else:
+                    self.metrics["avg_processing_time"] = (
+                        (self.metrics["avg_processing_time"] * (self.metrics["requests_processed"] - 1)) +
+                        processing_time
+                    ) / self.metrics["requests_processed"]
+
+                return result
+            except Exception as e:
+                self.metrics["errors"] += 1
+                self.logger.error(f"Error handling {request_type} request", error=str(e))
+                raise
+        else:
+            raise ValueError(f"No handler registered for request type: {request_type}")
+
+    async def send_response(self, callback_id: str, response: Any) -> None:
+        """Send a response using registered callbacks."""
+        if callback_id in self.response_callbacks:
+            try:
+                await self.response_callbacks[callback_id](response)
+            except Exception as e:
+                self.logger.error(f"Error sending response for {callback_id}", error=str(e))
+        else:
+            self.logger.warning(f"No callback registered for {callback_id}", agent=self.name)
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get agent performance metrics."""
+        return self.metrics.copy()
+
+    def reset_metrics(self) -> None:
+        """Reset agent metrics."""
+        self.metrics = {
+            "requests_processed": 0,
+            "errors": 0,
+            "avg_processing_time": 0.0,
+            "last_request_time": None
+        }
+        self.logger.info("Metrics reset", agent=self.name)
